@@ -47,10 +47,10 @@ def obtener_audio(video_id):
             "audio_url": audio_url
         })
 
-    except Exception:
+    except Exception as error:
         app.logger.exception("Error al obtener el audio")
         return jsonify({
-            "error": "No se pudo obtener el audio. Inténtalo de nuevo."
+            "error": str(error)
         }), 502
 
 
