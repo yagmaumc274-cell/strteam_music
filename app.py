@@ -6,6 +6,10 @@ from flask import Flask, Response
 
 app = Flask(__name__)
 
+@app.route("/version")
+def version():
+    return yt_dlp.version.__version__
+
 @app.route("/")
 def inicio():
     return "API activa"
