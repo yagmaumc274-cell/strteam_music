@@ -1,1 +1,59 @@
+import os
+import re
+from flask import Flask, jsonify
+import yt_dlp
 
+app = Flask(__name__)
+
+
+@app.route("/", methods=["GET"])
+def inicio():
+    return jsonify({
+        "estado": "activo",
+        "mensaje": "API de audio funcionando"
+    })
+
+
+@app.route("/audio/<video_id>", methods=["GET"])
+def obtener_audio(video_id):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        return jsonify({
+            "error": "ID de video no válido"
+        }), 400
+
+    opciones = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "format": "bestaudio/best",
+        "skip_download": True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(opciones) as ydl:
+            info = ydl.extract_info(
+                f"https://www.youtube.com/watch?v={video_id}",
+                download=False
+            )
+
+        audio_url = info.get("url")
+
+        if not audio_url:
+            return jsonify({
+                "error": "No se encontró la URL del audio"
+            }), 502
+
+        return jsonify({
+            "audio_url": audio_url
+        })
+
+    except Exception:
+        app.logger.exception("Error al obtener el audio")
+        return jsonify({
+            "error": "No se pudo obtener el audio. Inténtalo de nuevo."
+        }), 502
+
+
+if __name__ == "__main__":
+    puerto = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=puerto)
