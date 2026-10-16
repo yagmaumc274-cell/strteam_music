@@ -1,3 +1,4 @@
+
 import os
 import re
 from flask import Flask, jsonify
@@ -16,25 +17,28 @@ def inicio():
 
 @app.route("/audio/<video_id>", methods=["GET"])
 def obtener_audio(video_id):
+    video_id = video_id.strip()
+
     if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
-        return jsonify({
-            "error": "ID de video no válido"
-        }), 400
+        return jsonify({"error": "ID de video no válido"}), 400
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
 
     opciones = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "format": "bestaudio/best",
-        "skip_download": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["tv"]
+            }
+        }
     }
 
     try:
         with yt_dlp.YoutubeDL(opciones) as ydl:
-            info = ydl.extract_info(
-                f"https://www.youtube.com/watch?v={video_id}",
-                download=False
-            )
+            info = ydl.extract_info(url, download=False)
 
         audio_url = info.get("url")
 
@@ -44,14 +48,13 @@ def obtener_audio(video_id):
             }), 502
 
         return jsonify({
+            "titulo": info.get("title", "Desconocido"),
             "audio_url": audio_url
         })
 
     except Exception as error:
         app.logger.exception("Error al obtener el audio")
-        return jsonify({
-            "error": str(error)
-        }), 502
+        return jsonify({"error": str(error)}), 502
 
 
 if __name__ == "__main__":
