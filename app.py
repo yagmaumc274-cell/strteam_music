@@ -1,5 +1,7 @@
+import json
 import os
 import re
+import urllib.request
 
 import yt_dlp
 from flask import Flask, Response, jsonify, render_template_string, request
@@ -351,12 +353,12 @@ def radio():
     except ValueError:
         n = 25
 
-    fuentes = {"youtube_mix": radio_mix_ytdlp, "ytmusic": radio_ytmusic}
-    elegida = (request.args.get("fuente") or "").strip().lower()  # ?fuente=youtube_mix | ytmusic
+    fuentes = {"youtubei": radio_youtubei, "youtube_mix": radio_mix_ytdlp, "ytmusic": radio_ytmusic}
+    elegida = (request.args.get("fuente") or "").strip().lower()  # ?fuente=youtubei | youtube_mix | ytmusic
     if elegida in fuentes:
         orden = [(elegida, fuentes[elegida])]  # forzar una sola fuente (útil para probar)
     else:
-        orden = list(fuentes.items())  # por defecto: Mix de YouTube y luego YouTube Music
+        orden = list(fuentes.items())  # por defecto: youtubei, Mix con yt-dlp y YouTube Music
 
     errores = {}
     for fuente, funcion in orden:
@@ -374,6 +376,49 @@ def radio():
                               "No se pudo obtener la radio de este video.", errores))
     r.status_code = 502
     return r
+
+
+def radio_youtubei(video_id, n):
+    """Pide el Mix directamente a YouTube (endpoint interno /next), sin yt-dlp."""
+    cuerpo = {
+        "context": {"client": {"clientName": "WEB", "clientVersion": "2.20250101.00.00",
+                               "hl": "es", "gl": "US"}},
+        "videoId": video_id,
+        "playlistId": f"RD{video_id}",
+    }
+    req = urllib.request.Request(
+        "https://www.youtube.com/youtubei/v1/next?prettyPrint=false",
+        data=json.dumps(cuerpo).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Origin": "https://www.youtube.com",
+            "Accept-Language": "es-ES,es;q=0.9",
+        },
+        method="POST",
+    )
+    proxy = os.environ.get("YT_PROXY")
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy}) if proxy
+        else urllib.request.ProxyHandler())
+    with opener.open(req, timeout=10) as r:
+        data = json.load(r)
+    ids = []
+
+    def recorrer(x):
+        if isinstance(x, dict):
+            pv = x.get("playlistPanelVideoRenderer")
+            if isinstance(pv, dict) and pv.get("videoId"):
+                ids.append(pv["videoId"])
+            for v in x.values():
+                recorrer(v)
+        elif isinstance(x, list):
+            for v in x:
+                recorrer(v)
+
+    recorrer(data)
+    return unicos(ids, n)
 
 
 def radio_ytmusic(video_id, n):
