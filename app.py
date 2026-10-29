@@ -27,6 +27,11 @@ def opciones_ydl():
     """Opciones base + cookies y proxy opcionales tomados de variables de entorno."""
     opts = dict(YDL_OPTS)
     cookies = os.environ.get("YT_COOKIES")  # contenido del cookies.txt (formato Netscape)
+    try:
+        if request.args.get("sincookies"):  # ?sincookies=1 para probar sin cookies
+            cookies = None
+    except RuntimeError:
+        pass  # fuera de una petición web
     if cookies:
         ruta = "/tmp/yt_cookies.txt"  # en Vercel solo /tmp es escribible
         with open(ruta, "w", encoding="utf-8") as f:
@@ -51,6 +56,8 @@ def opciones_ydl():
 REGLAS = [
     ("requested format is not available", "FORMATO_NO_DISPONIBLE", 502,
      "YouTube no entregó formatos de audio (suele faltar el runtime de JavaScript o yt-dlp está desactualizado)."),
+    ("page needs to be reloaded", "SESION_INVALIDA", 502,
+     "YouTube rechazó la sesión (cookies vencidas o usadas desde otra IP). Prueba con ?sincookies=1 o exporta cookies nuevas."),
     ("private video", "VIDEO_PRIVADO", 403, "El video es privado."),
     ("video unavailable", "VIDEO_NO_DISPONIBLE", 404, "El video no está disponible o no existe."),
     ("has been removed", "VIDEO_ELIMINADO", 404, "El video fue eliminado."),
