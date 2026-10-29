@@ -19,6 +19,21 @@ YDL_OPTS = {
     "socket_timeout": 10,
 }
 
+def opciones_ydl():
+    """Opciones base + cookies y proxy opcionales tomados de variables de entorno."""
+    opts = dict(YDL_OPTS)
+    cookies = os.environ.get("YT_COOKIES")  # contenido del cookies.txt (formato Netscape)
+    if cookies:
+        ruta = "/tmp/yt_cookies.txt"  # en Vercel solo /tmp es escribible
+        with open(ruta, "w", encoding="utf-8") as f:
+            f.write(cookies)
+        opts["cookiefile"] = ruta
+    proxy = os.environ.get("YT_PROXY")  # ej: http://usuario:clave@host:puerto
+    if proxy:
+        opts["proxy"] = proxy
+    return opts
+
+
 # (texto a buscar en el error, código, HTTP status, explicación)
 REGLAS = [
     ("private video", "VIDEO_PRIVADO", 403, "El video es privado."),
@@ -68,7 +83,7 @@ def procesar(entrada):
             "Ingresa un ID de video (11 caracteres) o un link de YouTube válido.")
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
-        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+        with yt_dlp.YoutubeDL(opciones_ydl()) as ydl:
             info = ydl.extract_info(url, download=False)  # solo metadatos
         if not info.get("url"):
             return 502, error_payload("AudioNotFound", "AUDIO_NO_ENCONTRADO",
