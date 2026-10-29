@@ -338,8 +338,10 @@ def buscar():
 
 @app.route("/radio")
 def radio():
-    """Radio/Mix de YouTube a partir de un video: devuelve solo IDs y datos básicos.
-    Uso: /radio?id=kJQP7kiw5Fk&n=25   (también acepta ?url=<link de YouTube>)"""
+    """Radio de un video: devuelve solo IDs de videos relacionados.
+    Uso: /radio?id=kJQP7kiw5Fk&n=25   (también acepta ?url=<link de YouTube>)
+    Primero intenta el Mix de YouTube (yt-dlp); si falla, usa YouTube Music (ytmusicapi).
+    Con ?fuente=youtube_mix o ?fuente=ytmusic se fuerza una sola fuente."""
     video_id = parse_video_id(request.args.get("id") or request.args.get("url") or "")
     if not video_id:
         return jsonify(error_payload("ValidationError", "ENTRADA_INVALIDA",
@@ -348,42 +350,59 @@ def radio():
         n = max(1, min(int(request.args.get("n", 25)), 50))
     except ValueError:
         n = 25
+
+    fuentes = {"youtube_mix": radio_mix_ytdlp, "ytmusic": radio_ytmusic}
+    elegida = (request.args.get("fuente") or "").strip().lower()  # ?fuente=youtube_mix | ytmusic
+    if elegida in fuentes:
+        orden = [(elegida, fuentes[elegida])]  # forzar una sola fuente (útil para probar)
+    else:
+        orden = list(fuentes.items())  # por defecto: Mix de YouTube y luego YouTube Music
+
+    errores = {}
+    for fuente, funcion in orden:
+        try:
+            ids = funcion(video_id, n)
+            if ids:
+                return jsonify({"ok": True, "semilla": video_id, "fuente": fuente,
+                                "total": len(ids), "ids": ids})
+            errores[fuente] = "Sin resultados"
+        except Exception as e:
+            app.logger.warning("radio %s falló: %s", fuente, e)
+            errores[fuente] = f"{type(e).__name__}: {str(e)[:300]}"
+
+    r = jsonify(error_payload("RadioError", "RADIO_NO_DISPONIBLE",
+                              "No se pudo obtener la radio de este video.", errores))
+    r.status_code = 502
+    return r
+
+
+def radio_ytmusic(video_id, n):
+    from ytmusicapi import YTMusic
+    yt = YTMusic()
+    data = yt.get_watch_playlist(videoId=video_id, radio=True, limit=n)
+    return unicos([t.get("videoId") for t in data.get("tracks", [])], n)
+
+
+def radio_mix_ytdlp(video_id, n):
     opts = opciones_ydl()
     opts.update({"extract_flat": True, "skip_download": True, "format": None,
                  "ignore_no_formats_error": True, "noplaylist": False, "playlistend": n})
     opts.pop("js_runtimes", None)
     opts.pop("remote_components", None)
-    # El Mix de YouTube es la lista "RD" + ID del video semilla
     url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}&start_radio=1"
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        vistos, canciones = set(), []
-        for e in (info.get("entries") or []):
-            if not e or not e.get("id") or e["id"] in vistos:
-                continue
-            vistos.add(e["id"])
-            canciones.append({
-                "id": e["id"],
-                "titulo": e.get("title"),
-                "canal": e.get("uploader") or e.get("channel"),
-                "duracion_segundos": e.get("duration"),
-            })
-        if not canciones:
-            return jsonify(error_payload("EmptyRadio", "RADIO_VACIA",
-                                         "YouTube no devolvió canciones para este video.")), 502
-        return jsonify({"ok": True, "semilla": video_id, "total": len(canciones),
-                        "ids": [c["id"] for c in canciones], "canciones": canciones})
-    except DownloadError as e:
-        codigo, status, expl = clasificar(e)
-        r = jsonify(error_payload("DownloadError", codigo, expl, str(e)))
-        r.status_code = status
-        return r
-    except Exception as e:
-        app.logger.exception("Error en radio")
-        r = jsonify(error_payload(type(e).__name__, "ERROR_INESPERADO", "Error inesperado.", str(e)))
-        r.status_code = 500
-        return r
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    return unicos([e.get("id") for e in (info.get("entries") or []) if e], n)
+
+
+def unicos(ids, n):
+    """Quita vacíos y repetidos conservando el orden."""
+    vistos, salida = set(), []
+    for i in ids:
+        if i and ID_REGEX.match(i) and i not in vistos:
+            vistos.add(i)
+            salida.append(i)
+    return salida[:n]
 
 
 @app.route("/debug")
