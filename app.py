@@ -280,6 +280,105 @@ def api_info():
     return resp
 
 
+@app.route("/id")
+def sacar_id():
+    """Extrae el ID de un link de YouTube. No consulta a YouTube, así que no puede ser bloqueado."""
+    video_id = parse_video_id(request.args.get("url") or request.args.get("id") or "")
+    if not video_id:
+        return jsonify({"ok": False, "error": "No se encontró un ID válido."}), 400
+    return jsonify({"ok": True, "id": video_id})
+
+
+@app.route("/buscar")
+def buscar():
+    """Busca en YouTube y devuelve solo IDs y datos básicos (sin formatos de audio).
+    Uso: /buscar?q=nombre de la canción&n=10"""
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify(error_payload("ValidationError", "FALTA_BUSQUEDA",
+                                     "Falta el parámetro 'q' con el texto a buscar.")), 400
+    try:
+        n = max(1, min(int(request.args.get("n", 10)), 25))
+    except ValueError:
+        n = 10
+    opts = opciones_ydl()
+    opts.update({"extract_flat": True, "skip_download": True, "format": None,
+                 "ignore_no_formats_error": True})
+    opts.pop("js_runtimes", None)
+    opts.pop("remote_components", None)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{n}:{q}", download=False)
+        resultados = [{
+            "id": e.get("id"),
+            "titulo": e.get("title"),
+            "canal": e.get("uploader") or e.get("channel"),
+            "duracion_segundos": e.get("duration"),
+            "miniatura": (e.get("thumbnails") or [{}])[-1].get("url") if e.get("thumbnails") else None,
+        } for e in (info.get("entries") or []) if e and e.get("id")]
+        return jsonify({"ok": True, "consulta": q, "total": len(resultados), "resultados": resultados})
+    except DownloadError as e:
+        codigo, status, expl = clasificar(e)
+        r = jsonify(error_payload("DownloadError", codigo, expl, str(e)))
+        r.status_code = status
+        return r
+    except Exception as e:
+        app.logger.exception("Error en búsqueda")
+        r = jsonify(error_payload(type(e).__name__, "ERROR_INESPERADO", "Error inesperado.", str(e)))
+        r.status_code = 500
+        return r
+
+
+@app.route("/radio")
+def radio():
+    """Radio/Mix de YouTube a partir de un video: devuelve solo IDs y datos básicos.
+    Uso: /radio?id=kJQP7kiw5Fk&n=25   (también acepta ?url=<link de YouTube>)"""
+    video_id = parse_video_id(request.args.get("id") or request.args.get("url") or "")
+    if not video_id:
+        return jsonify(error_payload("ValidationError", "ENTRADA_INVALIDA",
+                                     "Ingresa un ID de video (11 caracteres) o un link de YouTube válido.")), 400
+    try:
+        n = max(1, min(int(request.args.get("n", 25)), 50))
+    except ValueError:
+        n = 25
+    opts = opciones_ydl()
+    opts.update({"extract_flat": True, "skip_download": True, "format": None,
+                 "ignore_no_formats_error": True, "noplaylist": False, "playlistend": n})
+    opts.pop("js_runtimes", None)
+    opts.pop("remote_components", None)
+    # El Mix de YouTube es la lista "RD" + ID del video semilla
+    url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}&start_radio=1"
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        vistos, canciones = set(), []
+        for e in (info.get("entries") or []):
+            if not e or not e.get("id") or e["id"] in vistos:
+                continue
+            vistos.add(e["id"])
+            canciones.append({
+                "id": e["id"],
+                "titulo": e.get("title"),
+                "canal": e.get("uploader") or e.get("channel"),
+                "duracion_segundos": e.get("duration"),
+            })
+        if not canciones:
+            return jsonify(error_payload("EmptyRadio", "RADIO_VACIA",
+                                         "YouTube no devolvió canciones para este video.")), 502
+        return jsonify({"ok": True, "semilla": video_id, "total": len(canciones),
+                        "ids": [c["id"] for c in canciones], "canciones": canciones})
+    except DownloadError as e:
+        codigo, status, expl = clasificar(e)
+        r = jsonify(error_payload("DownloadError", codigo, expl, str(e)))
+        r.status_code = status
+        return r
+    except Exception as e:
+        app.logger.exception("Error en radio")
+        r = jsonify(error_payload(type(e).__name__, "ERROR_INESPERADO", "Error inesperado.", str(e)))
+        r.status_code = 500
+        return r
+
+
 @app.route("/debug")
 def debug():
     """Diagnóstico: versiones y si Deno está disponible. No muestra cookies ni datos sensibles."""
