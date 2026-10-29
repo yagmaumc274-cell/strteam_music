@@ -251,8 +251,8 @@ def cors(resp):
     return resp
 
 
-@app.route("/")
-def inicio():
+@app.route("/audio-test")
+def inicio_audio():
     """Pide el ID/link primero; al enviarlo muestra los datos o el error."""
     entrada = (request.args.get("id") or request.args.get("url") or "").strip()
     resultado, status, dur, fecha = None, 200, "—", "—"
@@ -267,6 +267,91 @@ def inicio():
         PAGINA, entrada=entrada, resultado=resultado, status=status, dur=dur, fecha=fecha),
         mimetype="text/html")
     return resp
+
+
+PAGINA_RADIO = """<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Radio de YouTube</title>
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --line:#2a2f3a; --txt:#e8eaf0; --mut:#9aa3b2; --ac:#4f8cff; --ok:#3ecf8e; --err:#ff6b6b; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f5f6f8; --card:#fff; --line:#dde1e8; --txt:#161a22; --mut:#5d6675; --ac:#2563eb; --ok:#0f9d63; --err:#d63c3c; }
+  }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--txt); font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; padding:24px 16px }
+  main { max-width:640px; margin:0 auto }
+  h1 { font-size:1.4rem; margin:0 0 4px } p.sub { color:var(--mut); margin:0 0 20px }
+  form { display:flex; gap:8px; flex-wrap:wrap }
+  input[type=text] { flex:1 1 260px; padding:12px 14px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--txt); font-size:1rem }
+  input[type=text]:focus { outline:2px solid var(--ac); border-color:transparent }
+  button { padding:12px 20px; border:0; border-radius:10px; background:var(--ac); color:#fff; font-size:1rem; font-weight:600; cursor:pointer }
+  .card { margin-top:20px; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px }
+  .card.err { border-color:var(--err) }
+  .tag { display:inline-block; font-size:.75rem; font-weight:700; padding:2px 8px; border-radius:999px; margin-bottom:8px }
+  .tag.ok { color:var(--ok); border:1px solid var(--ok) } .tag.err { color:var(--err); border:1px solid var(--err) }
+  ol { margin:10px 0; padding-left:28px } li { padding:2px 0 }
+  code { background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:1px 6px; font-size:.85rem }
+  pre { white-space:pre-wrap; word-break:break-word; font-size:.8rem; background:var(--bg); padding:10px; border-radius:8px; border:1px solid var(--line) }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px }
+  .row button { padding:8px 14px; font-size:.9rem; background:var(--card); color:var(--txt); border:1px solid var(--line) }
+  footer { margin-top:28px; color:var(--mut); font-size:.85rem }
+</style>
+</head>
+<body>
+<main>
+  <h1>📻 Radio de YouTube</h1>
+  <p class="sub">Ingresa el ID o el link de un video y obtén los IDs de su radio (videos relacionados).</p>
+  <form method="get" action="/">
+    <input type="text" name="id" value="{{ entrada }}" placeholder="Ej: kJQP7kiw5Fk o un link de YouTube" autocomplete="off" autofocus required>
+    <button type="submit">Obtener radio</button>
+  </form>
+
+  {% if resultado %}
+    {% if resultado.ok %}
+      <section class="card">
+        <span class="tag ok">✅ {{ resultado.total }} IDs · fuente: {{ resultado.fuente }}</span>
+        <ol>{% for i in resultado.ids %}<li><code>{{ i }}</code></li>{% endfor %}</ol>
+        <div class="row">
+          <button type="button" onclick="navigator.clipboard.writeText({{ resultado.ids|join(',')|tojson }})">Copiar IDs (separados por coma)</button>
+          <button type="button" onclick="navigator.clipboard.writeText({{ resultado.ids|join('\n')|tojson }})">Copiar IDs (uno por línea)</button>
+        </div>
+      </section>
+    {% else %}
+      {% set e = resultado.error %}
+      <section class="card err">
+        <span class="tag err">❌ ERROR · {{ e.tipo }}</span>
+        <h2 style="font-size:1.1rem;margin:0 0 8px">{{ e.explicacion }}</h2>
+        {% if e.detalle %}<details open><summary>Detalle por fuente</summary>
+          {% if e.detalle is mapping %}{% for k, v in e.detalle.items() %}<p><code>{{ k }}</code></p><pre>{{ v }}</pre>{% endfor %}
+          {% else %}<pre>{{ e.detalle }}</pre>{% endif %}
+        </details>{% endif %}
+      </section>
+    {% endif %}
+  {% endif %}
+
+  <footer>API: <code>/radio?id=&lt;id&gt;&amp;n=25</code> devuelve JSON con los IDs · <code>/buscar?q=&lt;texto&gt;</code> busca videos.</footer>
+</main>
+</body>
+</html>"""
+
+
+@app.route("/")
+def inicio():
+    """Pide el ID/link y muestra los IDs de su radio."""
+    entrada = (request.args.get("id") or request.args.get("url") or "").strip()
+    resultado = None
+    if entrada:
+        video_id = parse_video_id(entrada)
+        if video_id:
+            _, resultado = obtener_radio(video_id, 25, (request.args.get("fuente") or "").strip().lower())
+        else:
+            resultado = error_payload("ValidationError", "ENTRADA_INVALIDA",
+                                      "Ingresa un ID de video (11 caracteres) o un link de YouTube válido.")
+    return Response(render_template_string(PAGINA_RADIO, entrada=entrada, resultado=resultado),
+                    mimetype="text/html")
 
 
 @app.route("/audio/<video_id>")
@@ -338,12 +423,33 @@ def buscar():
         return r
 
 
+def obtener_radio(video_id, n, elegida=""):
+    """Devuelve (status_http, dict_json) con los IDs de la radio de un video."""
+    fuentes = {"youtubei": radio_youtubei, "youtube_mix": radio_mix_ytdlp, "ytmusic": radio_ytmusic}
+    if elegida in fuentes:
+        orden = [(elegida, fuentes[elegida])]  # forzar una sola fuente (útil para probar)
+    else:
+        orden = list(fuentes.items())  # por defecto: youtubei, Mix con yt-dlp y YouTube Music
+    errores = {}
+    for fuente, funcion in orden:
+        try:
+            ids = funcion(video_id, n)
+            if ids:
+                return 200, {"ok": True, "semilla": video_id, "fuente": fuente,
+                             "total": len(ids), "ids": ids}
+            errores[fuente] = "Sin resultados"
+        except Exception as e:
+            app.logger.warning("radio %s falló: %s", fuente, e)
+            errores[fuente] = f"{type(e).__name__}: {str(e)[:300]}"
+    return 502, error_payload("RadioError", "RADIO_NO_DISPONIBLE",
+                              "No se pudo obtener la radio de este video.", errores)
+
+
 @app.route("/radio")
 def radio():
     """Radio de un video: devuelve solo IDs de videos relacionados.
     Uso: /radio?id=kJQP7kiw5Fk&n=25   (también acepta ?url=<link de YouTube>)
-    Primero intenta el Mix de YouTube (yt-dlp); si falla, usa YouTube Music (ytmusicapi).
-    Con ?fuente=youtube_mix o ?fuente=ytmusic se fuerza una sola fuente."""
+    Con ?fuente=youtubei | youtube_mix | ytmusic se fuerza una sola fuente."""
     video_id = parse_video_id(request.args.get("id") or request.args.get("url") or "")
     if not video_id:
         return jsonify(error_payload("ValidationError", "ENTRADA_INVALIDA",
@@ -352,29 +458,9 @@ def radio():
         n = max(1, min(int(request.args.get("n", 25)), 50))
     except ValueError:
         n = 25
-
-    fuentes = {"youtubei": radio_youtubei, "youtube_mix": radio_mix_ytdlp, "ytmusic": radio_ytmusic}
-    elegida = (request.args.get("fuente") or "").strip().lower()  # ?fuente=youtubei | youtube_mix | ytmusic
-    if elegida in fuentes:
-        orden = [(elegida, fuentes[elegida])]  # forzar una sola fuente (útil para probar)
-    else:
-        orden = list(fuentes.items())  # por defecto: youtubei, Mix con yt-dlp y YouTube Music
-
-    errores = {}
-    for fuente, funcion in orden:
-        try:
-            ids = funcion(video_id, n)
-            if ids:
-                return jsonify({"ok": True, "semilla": video_id, "fuente": fuente,
-                                "total": len(ids), "ids": ids})
-            errores[fuente] = "Sin resultados"
-        except Exception as e:
-            app.logger.warning("radio %s falló: %s", fuente, e)
-            errores[fuente] = f"{type(e).__name__}: {str(e)[:300]}"
-
-    r = jsonify(error_payload("RadioError", "RADIO_NO_DISPONIBLE",
-                              "No se pudo obtener la radio de este video.", errores))
-    r.status_code = 502
+    status, body = obtener_radio(video_id, n, (request.args.get("fuente") or "").strip().lower())
+    r = jsonify(body)
+    r.status_code = status
     return r
 
 
