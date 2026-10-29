@@ -52,6 +52,7 @@ REGLAS = [
     ("has been removed", "VIDEO_ELIMINADO", 404, "El video fue eliminado."),
     ("confirm your age", "RESTRICCION_EDAD", 403, "El video tiene restricción de edad."),
     ("sign in to confirm you", "BLOQUEO_BOT", 429, "YouTube detectó tráfico automatizado y pide iniciar sesión o cookies."),
+    ("available in your country", "BLOQUEO_REGION", 451, "Este video está bloqueado en el país del servidor (Vercel). Cambia la región de la función a un país donde esté disponible."),
     ("not available in your country", "BLOQUEO_REGION", 451, "Video bloqueado en la región del servidor."),
     ("copyright", "DERECHOS_AUTOR", 451, "Video bloqueado por derechos de autor."),
     ("members-only", "SOLO_MIEMBROS", 403, "Video solo para miembros del canal."),
