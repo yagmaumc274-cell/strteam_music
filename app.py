@@ -15,9 +15,13 @@ YDL_OPTS = {
     "quiet": True,
     "no_warnings": True,
     "noplaylist": True,
-    "format": "bestaudio/best",
+    "format": "ba/b",
     "socket_timeout": 10,
 }
+
+# Clientes de YouTube a probar, en orden (None = el predeterminado de yt-dlp)
+CLIENTES = [None, "tv", "web_safari", "mweb", "android_vr"]
+
 
 def opciones_ydl():
     """Opciones base + cookies y proxy opcionales tomados de variables de entorno."""
@@ -95,8 +99,24 @@ def procesar(entrada):
             "Ingresa un ID de video (11 caracteres) o un link de YouTube válido.")
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
-        with yt_dlp.YoutubeDL(opciones_ydl()) as ydl:
-            info = ydl.extract_info(url, download=False)  # solo metadatos
+        info, cliente = None, "default"
+        ultimo_error = None
+        # Si YouTube no entrega formatos con el cliente por defecto, se prueban otros.
+        for cliente_prueba in CLIENTES:
+            opts = opciones_ydl()
+            if cliente_prueba:
+                opts["extractor_args"] = {"youtube": {"player_client": [cliente_prueba]}}
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)  # solo metadatos
+                cliente = cliente_prueba or "default"
+                break
+            except DownloadError as e:
+                ultimo_error = e
+                if "requested format is not available" not in str(e).lower():
+                    raise
+        if info is None:
+            raise ultimo_error
         if not info.get("url"):
             return 502, error_payload("AudioNotFound", "AUDIO_NO_ENCONTRADO",
                                       "No se encontró una URL de audio para este video.")
@@ -109,6 +129,7 @@ def procesar(entrada):
             "fecha_subida": info.get("upload_date"),
             "miniatura": info.get("thumbnail"),
             "url_audio": info.get("url"),
+            "cliente_youtube": cliente,
         }}
     except DownloadError as e:
         codigo, status, expl = clasificar(e)
@@ -257,6 +278,39 @@ def api_info():
     resp = jsonify(body)
     resp.status_code = status
     return resp
+
+
+@app.route("/debug")
+def debug():
+    """Diagnóstico: versiones y si Deno está disponible. No muestra cookies ni datos sensibles."""
+    import subprocess
+    out = {"yt_dlp": getattr(getattr(yt_dlp, "version", None), "__version__", "?"),
+           "cookies_configuradas": bool(os.environ.get("YT_COOKIES")),
+           "proxy_configurado": bool(os.environ.get("YT_PROXY")),
+           "region_vercel": os.environ.get("VERCEL_REGION")}
+    try:
+        import deno
+        ruta = deno.find_deno_bin()
+        out["deno_ruta"] = ruta
+        r = subprocess.run([ruta, "--version"], capture_output=True, text=True, timeout=10,
+                           env={**os.environ, "DENO_DIR": "/tmp/deno"})
+        out["deno_version"] = (r.stdout or r.stderr).strip().splitlines()[:1]
+    except Exception as e:
+        out["deno_error"] = f"{type(e).__name__}: {e}"
+    vid = parse_video_id(request.args.get("id", ""))
+    if vid:
+        try:
+            opts = opciones_ydl()
+            opts.update({"format": None, "ignore_no_formats_error": True, "skip_download": True})
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
+            fmts = info.get("formats") or []
+            out["formatos_total"] = len(fmts)
+            out["formatos_audio"] = len([f for f in fmts if f.get("vcodec") == "none"])
+            out["formatos_ejemplo"] = [f"{f.get('format_id')}:{f.get('ext')}:{f.get('format_note') or ''}" for f in fmts[:8]]
+        except Exception as e:
+            out["formatos_error"] = f"{type(e).__name__}: {str(e)[:300]}"
+    return jsonify(out)
 
 
 if __name__ == "__main__":
