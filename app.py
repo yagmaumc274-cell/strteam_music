@@ -1,6 +1,7 @@
 
 """
-API de radio y búsqueda de YouTube Music, sin yt-dlp.
+API de radio y búsqueda de YouTube.
+Sin yt-dlp y sin API key oficial de YouTube.
 
 Endpoints:
   GET /                         -> documentación
@@ -9,16 +10,12 @@ Endpoints:
   GET /id?url=<link>
   GET /salud
 
-/radio devuelve:
+La radio devuelve IDs y metadatos cuando están disponibles:
   id, titulo, artista, duracion, duracion_segundos,
   album, miniatura y url.
 
-Seguridad opcional:
-  Si defines API_KEY, envía X-API-Key o ?key=<clave>.
-
-Proxy opcional:
-  YT_PROXY=http://usuario:clave@host:puerto
-  Solo para la fuente youtubei.
+API_KEY es opcional para proteger TU API.
+No es una clave de YouTube.
 """
 
 import hmac
@@ -36,8 +33,7 @@ app.json.sort_keys = False
 
 ID_REGEX = re.compile(r"^[A-Za-z0-9_-]{11}$")
 URL_ID_REGEX = re.compile(
-    r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)"
-    r"([A-Za-z0-9_-]{11})"
+    r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})"
 )
 
 
@@ -55,7 +51,7 @@ def parse_video_id(texto):
 
 
 def unicos(ids, n):
-    """Elimina IDs inválidos y duplicados conservando el orden."""
+    """Elimina IDs inválidos y duplicados, conservando el orden."""
     vistos = set()
     salida = []
 
@@ -68,8 +64,8 @@ def unicos(ids, n):
             vistos.add(video_id)
             salida.append(video_id)
 
-        if len(salida) >= n:
-            break
+            if len(salida) >= n:
+                break
 
     return salida
 
@@ -95,8 +91,86 @@ def error(status, codigo, mensaje, detalle=None):
     return respuesta
 
 
+def texto_simple(objeto):
+    """Extrae texto de estructuras de texto habituales de YouTube."""
+    if not isinstance(objeto, dict):
+        return ""
+
+    if isinstance(objeto.get("simpleText"), str):
+        return objeto["simpleText"]
+
+    runs = objeto.get("runs")
+    if isinstance(runs, list):
+        return "".join(
+            str(run.get("text", ""))
+            for run in runs
+            if isinstance(run, dict)
+        )
+
+    return ""
+
+
+def extraer_texto_renderer(renderer, *nombres):
+    """Busca texto en los campos indicados de un renderer."""
+    for nombre in nombres:
+        valor = texto_simple(renderer.get(nombre))
+        if valor:
+            return valor.strip()
+
+    return ""
+
+
+def extraer_album(renderer):
+    """Intenta obtener el álbum cuando la respuesta lo incluye."""
+    for nombre in ("longBylineText", "shortBylineText"):
+        byline = renderer.get(nombre)
+
+        if not isinstance(byline, dict):
+            continue
+
+        runs = byline.get("runs", [])
+
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+
+            texto = (run.get("text") or "").strip()
+            endpoint = run.get("navigationEndpoint", {})
+            browse_endpoint = endpoint.get("browseEndpoint", {})
+            page_type = (
+                browse_endpoint
+                .get("browseEndpointContextSupportedConfigs", {})
+                .get("browseEndpointContextMusicConfig", {})
+                .get("pageType", "")
+            )
+
+            if "ALBUM" in str(page_type).upper():
+                return texto
+
+    return ""
+
+
+def extraer_miniatura(renderer, video_id):
+    """Utiliza la miniatura del JSON o una URL estándar como alternativa."""
+    thumbnails = (
+        renderer.get("thumbnail", {})
+        .get("thumbnails", [])
+    )
+
+    if isinstance(thumbnails, list) and thumbnails:
+        validas = [
+            t for t in thumbnails
+            if isinstance(t, dict) and t.get("url")
+        ]
+
+        if validas:
+            return validas[-1]["url"]
+
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+
 def duracion_a_segundos(duracion):
-    """Convierte mm:ss o hh:mm:ss en segundos."""
+    """Convierte mm:ss o hh:mm:ss a segundos."""
     if not duracion:
         return 0
 
@@ -107,34 +181,31 @@ def duracion_a_segundos(duracion):
             return 0
 
         total = 0
+
         for parte in partes:
             if parte < 0:
                 return 0
             total = total * 60 + parte
 
         return total
+
     except (ValueError, TypeError):
         return 0
 
 
-def normalizar_pista(track):
-    """Convierte una pista de YTMusic a un formato uniforme."""
+def normalizar_pista_ytmusic(track):
+    """Normaliza una pista recibida de ytmusicapi."""
     video_id = track.get("videoId")
 
     if not isinstance(video_id, str) or not ID_REGEX.fullmatch(video_id):
         return None
 
     artistas = track.get("artists") or []
-    nombres_artistas = []
-
-    for artista in artistas:
-        if isinstance(artista, dict):
-            nombre = artista.get("name")
-            if nombre:
-                nombres_artistas.append(str(nombre))
-
-    # Algunos resultados pueden proporcionar el artista como texto.
-    artista_texto = ", ".join(nombres_artistas) or "Artista desconocido"
+    nombres = [
+        str(a["name"])
+        for a in artistas
+        if isinstance(a, dict) and a.get("name")
+    ]
 
     album = track.get("album")
     album_nombre = (
@@ -145,24 +216,34 @@ def normalizar_pista(track):
 
     duracion = str(track.get("duration") or "")
 
+    thumbnails = track.get("thumbnails") or []
+    miniatura = ""
+
+    if thumbnails:
+        miniatura = thumbnails[-1].get("url", "")
+
+    if not miniatura:
+        miniatura = (
+            f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+        )
+
     return {
         "id": video_id,
         "titulo": str(track.get("title") or "Canción desconocida"),
-        "artista": artista_texto,
+        "artista": ", ".join(nombres) or "Artista desconocido",
         "duracion": duracion,
         "duracion_segundos": duracion_a_segundos(duracion),
         "album": album_nombre,
-        "miniatura": (
-            f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
-        ),
+        "miniatura": miniatura,
         "url": f"https://www.youtube.com/watch?v={video_id}",
     }
 
 
-# ---------- seguridad y cabeceras ----------
+# ---------- seguridad de TU API ----------
 
 @app.before_request
 def verificar_clave():
+    # API_KEY protege tu servidor, no es una clave de YouTube.
     clave = os.environ.get("API_KEY")
 
     if (
@@ -172,13 +253,17 @@ def verificar_clave():
     ):
         return None
 
-    enviada = request.headers.get("X-API-Key") or request.args.get("key") or ""
+    enviada = (
+        request.headers.get("X-API-Key")
+        or request.args.get("key")
+        or ""
+    )
 
     if not hmac.compare_digest(enviada, clave):
         return error(
             401,
             "NO_AUTORIZADO",
-            "Falta o es incorrecta la clave de la API.",
+            "Falta o es incorrecta la clave de esta API.",
         )
 
     return None
@@ -213,14 +298,14 @@ def error_inesperado(e):
     )
 
 
-# ---------- fuente de radio: YouTubei ----------
+# ---------- radio mediante YouTubei ----------
 
 def radio_youtubei(video_id, n):
     """
-    Consulta la radio de YouTube directamente.
+    Extrae pistas de playlistPanelVideoRenderer.
 
-    Esta fuente extrae IDs. No garantiza los metadatos completos
-    de cada pista.
+    La respuesta de YouTube puede variar y algunos metadatos
+    podrían no estar disponibles.
     """
     cuerpo = {
         "context": {
@@ -253,29 +338,60 @@ def radio_youtubei(video_id, n):
 
     proxy = os.environ.get("YT_PROXY")
 
-    if proxy:
-        manejador = urllib.request.ProxyHandler({
+    manejador = (
+        urllib.request.ProxyHandler({
             "http": proxy,
             "https": proxy,
         })
-    else:
-        manejador = urllib.request.ProxyHandler()
+        if proxy
+        else urllib.request.ProxyHandler()
+    )
 
     opener = urllib.request.build_opener(manejador)
 
-    with opener.open(req, timeout=10) as respuesta:
+    with opener.open(req, timeout=15) as respuesta:
         data = json.load(respuesta)
 
-    ids = []
+    pistas = []
 
     def recorrer(objeto):
         if isinstance(objeto, dict):
             renderer = objeto.get("playlistPanelVideoRenderer")
 
             if isinstance(renderer, dict):
-                video_id_encontrado = renderer.get("videoId")
-                if video_id_encontrado:
-                    ids.append(video_id_encontrado)
+                track_id = renderer.get("videoId")
+
+                if isinstance(track_id, str) and ID_REGEX.fullmatch(track_id):
+                    titulo = extraer_texto_renderer(
+                        renderer, "title"
+                    )
+
+                    artista = extraer_texto_renderer(
+                        renderer,
+                        "shortBylineText",
+                        "longBylineText",
+                    )
+
+                    duracion = extraer_texto_renderer(
+                        renderer, "lengthText"
+                    )
+
+                    pistas.append({
+                        "id": track_id,
+                        "titulo": titulo or "Canción desconocida",
+                        "artista": artista or "Artista desconocido",
+                        "duracion": duracion,
+                        "duracion_segundos": duracion_a_segundos(
+                            duracion
+                        ),
+                        "album": extraer_album(renderer),
+                        "miniatura": extraer_miniatura(
+                            renderer, track_id
+                        ),
+                        "url": (
+                            f"https://www.youtube.com/watch?v={track_id}"
+                        ),
+                    })
 
             for valor in objeto.values():
                 recorrer(valor)
@@ -286,16 +402,27 @@ def radio_youtubei(video_id, n):
 
     recorrer(data)
 
-    return unicos(ids, n)
+    # Deduplicar sin perder los metadatos de la primera aparición.
+    salida = []
+    vistos = set()
+
+    for pista in pistas:
+        if pista["id"] in vistos:
+            continue
+
+        vistos.add(pista["id"])
+        salida.append(pista)
+
+        if len(salida) >= n:
+            break
+
+    return salida
 
 
-# ---------- fuente de radio: YouTube Music ----------
+# ---------- radio mediante YouTube Music ----------
 
 def radio_ytmusic(video_id, n):
-    """
-    Obtiene la radio mediante ytmusicapi e intenta conservar
-    los metadatos que proporciona para cada pista.
-    """
+    """Obtiene IDs y metadatos con ytmusicapi, sin API key oficial."""
     from ytmusicapi import YTMusic
 
     ytmusic = YTMusic()
@@ -309,12 +436,9 @@ def radio_ytmusic(video_id, n):
     vistos = set()
 
     for track in data.get("tracks", []):
-        pista = normalizar_pista(track)
+        pista = normalizar_pista_ytmusic(track)
 
-        if not pista:
-            continue
-
-        if pista["id"] in vistos:
+        if not pista or pista["id"] in vistos:
             continue
 
         vistos.add(pista["id"])
@@ -337,18 +461,18 @@ FUENTES = {
 @app.get("/")
 def inicio():
     return jsonify({
-        "nombre": "API de radio y búsqueda de YouTube",
+        "nombre": "API de radio de YouTube",
         "endpoints": {
             "/radio": (
                 "?id=<id|link>&n=25&fuente=youtubei|ytmusic "
-                "-> canciones relacionadas"
+                "-> canciones con metadatos disponibles"
             ),
-            "/buscar": "?q=<texto>&n=10 -> resultados de búsqueda",
+            "/buscar": "?q=<texto>&n=10 -> búsqueda de videos",
             "/id": "?url=<link> -> extrae el ID",
             "/salud": "estado del servicio",
         },
         "autenticacion": (
-            "X-API-Key"
+            "API_KEY propia"
             if os.environ.get("API_KEY")
             else "ninguna"
         ),
@@ -375,10 +499,7 @@ def sacar_id():
             "No se encontró un ID de video válido.",
         )
 
-    return jsonify({
-        "ok": True,
-        "id": video_id,
-    })
+    return jsonify({"ok": True, "id": video_id})
 
 
 @app.get("/radio")
@@ -393,7 +514,7 @@ def radio():
         return error(
             400,
             "ENTRADA_INVALIDA",
-            "Envía 'id' (11 caracteres) o un enlace válido.",
+            "Envía un ID de 11 caracteres o un enlace válido.",
         )
 
     n = entero("n", 25, 1, 50)
@@ -416,34 +537,11 @@ def radio():
 
     for nombre, funcion in orden:
         try:
-            resultado = funcion(video_id, n)
+            canciones = funcion(video_id, n)
 
-            if not resultado:
+            if not canciones:
                 errores[nombre] = "Sin resultados"
                 continue
-
-            if nombre == "ytmusic":
-                canciones = resultado
-            else:
-                # YouTubei solo proporciona IDs con esta implementación.
-                canciones = [
-                    {
-                        "id": track_id,
-                        "titulo": "",
-                        "artista": "",
-                        "duracion": "",
-                        "duracion_segundos": 0,
-                        "album": "",
-                        "miniatura": (
-                            f"https://i.ytimg.com/vi/"
-                            f"{track_id}/hqdefault.jpg"
-                        ),
-                        "url": (
-                            f"https://www.youtube.com/watch?v={track_id}"
-                        ),
-                    }
-                    for track_id in resultado
-                ]
 
             respuesta = jsonify({
                 "ok": True,
@@ -463,6 +561,7 @@ def radio():
                 nombre,
                 e,
             )
+
             errores[nombre] = (
                 f"{type(e).__name__}: {str(e)[:300]}"
             )
@@ -507,12 +606,16 @@ def buscar():
         )
 
     resultados = []
+    vistos = set()
 
     for encontrado in encontrados:
-        pista = normalizar_pista(encontrado)
+        pista = normalizar_pista_ytmusic(encontrado)
 
-        if pista:
-            resultados.append(pista)
+        if not pista or pista["id"] in vistos:
+            continue
+
+        vistos.add(pista["id"])
+        resultados.append(pista)
 
         if len(resultados) >= n:
             break
