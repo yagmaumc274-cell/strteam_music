@@ -1,4 +1,3 @@
-
 """
 API de radio y búsqueda de YouTube.
 Sin yt-dlp y sin API key oficial de YouTube.
@@ -10,9 +9,18 @@ Endpoints:
   GET /id?url=<link>
   GET /salud
 
-La radio devuelve IDs y metadatos cuando están disponibles:
+La radio devuelve:
   id, titulo, artista, duracion, duracion_segundos,
   album, miniatura y url.
+
+Filtro musical:
+  - Duración mínima: 60 segundos.
+  - Duración máxima: 420 segundos (7 minutos).
+  - Excluye mixes, megamixes, mashups, álbumes completos,
+    playlists, tutoriales, reacciones y otros videos no musicales.
+  - Elimina IDs duplicados.
+  - Busca candidatos adicionales para intentar completar
+    la cantidad solicitada.
 
 API_KEY es opcional para proteger TU API.
 No es una clave de YouTube.
@@ -22,22 +30,119 @@ import hmac
 import json
 import os
 import re
+import unicodedata
 import urllib.request
 
 from flask import Flask, jsonify, request
 from werkzeug.exceptions import HTTPException
 
+
 app = Flask(__name__)
 app.json.ensure_ascii = False
 app.json.sort_keys = False
 
+
 ID_REGEX = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
 URL_ID_REGEX = re.compile(
-    r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})"
+    r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)"
+    r"([A-Za-z0-9_-]{11})"
 )
 
 
-# ---------- utilidades ----------
+# ==========================================================
+# CONFIGURACIÓN DEL FILTRO MUSICAL
+# ==========================================================
+
+DURACION_MINIMA = 60
+DURACION_MAXIMA = 7 * 60
+
+# Se buscan más candidatos que los solicitados porque
+# algunos se descartarán al aplicar el filtro.
+FACTOR_CANDIDATOS = 4
+MAX_CANDIDATOS = 100
+
+
+# Frases que indican que probablemente no sea una canción normal.
+FRASES_EXCLUIDAS = (
+    "full album",
+    "complete album",
+    "album completo",
+    "album completo canciones",
+    "full playlist",
+    "playlist completa",
+    "official playlist",
+    "full mix",
+    "mega mix",
+    "megamix",
+    "megamix completo",
+    "megamix cumbia",
+    "megamix reggaeton",
+    "megamix bachata",
+    "megamix salsa",
+    "megamix merengue",
+    "continuous mix",
+    "dj mix",
+    "mix completo",
+    "mix de canciones",
+    "mix de exitos",
+    "mix de éxitos",
+    "mashup",
+    "tutorial",
+    "tutorial de guitarra",
+    "tutorial de piano",
+    "como tocar",
+    "como cantar",
+    "how to play",
+    "how to sing",
+    "reaction",
+    "reaccion",
+    "reacción",
+    "review",
+    "entrevista",
+    "interview",
+    "podcast",
+    "noticias",
+    "news",
+    "analisis",
+    "análisis",
+    "gameplay",
+    "detras de camaras",
+    "detrás de cámaras",
+    "making of",
+    "karaoke instrumental",
+    "instrumental karaoke",
+    "letra y traduccion",
+    "letra y traducción",
+)
+
+# Indicadores que normalmente describen recopilaciones,
+# aunque el título no contenga la palabra "mix".
+INDICADORES_RECORRIDO = (
+    " nonstop ",
+    " non stop ",
+    " sin parar ",
+    " una hora ",
+    " 1 hora ",
+    " 2 horas ",
+    " 3 horas ",
+    " 10 canciones ",
+    " 20 canciones ",
+    " 50 canciones ",
+    " los mejores exitos ",
+    " los mejores éxitos ",
+    " mejores canciones de ",
+    " recopilacion ",
+    " recopilación ",
+    " compilacion ",
+    " compilación ",
+    " playlist ",
+)
+
+
+# ==========================================================
+# UTILIDADES
+# ==========================================================
 
 def parse_video_id(texto):
     """Acepta un ID de YouTube o un enlace compatible."""
@@ -100,6 +205,7 @@ def texto_simple(objeto):
         return objeto["simpleText"]
 
     runs = objeto.get("runs")
+
     if isinstance(runs, list):
         return "".join(
             str(run.get("text", ""))
@@ -114,6 +220,7 @@ def extraer_texto_renderer(renderer, *nombres):
     """Busca texto en los campos indicados de un renderer."""
     for nombre in nombres:
         valor = texto_simple(renderer.get(nombre))
+
         if valor:
             return valor.strip()
 
@@ -137,6 +244,7 @@ def extraer_album(renderer):
             texto = (run.get("text") or "").strip()
             endpoint = run.get("navigationEndpoint", {})
             browse_endpoint = endpoint.get("browseEndpoint", {})
+
             page_type = (
                 browse_endpoint
                 .get("browseEndpointContextSupportedConfigs", {})
@@ -151,7 +259,7 @@ def extraer_album(renderer):
 
 
 def extraer_miniatura(renderer, video_id):
-    """Utiliza la miniatura del JSON o una URL estándar como alternativa."""
+    """Obtiene la miniatura del JSON o usa una URL estándar."""
     thumbnails = (
         renderer.get("thumbnail", {})
         .get("thumbnails", [])
@@ -175,7 +283,7 @@ def duracion_a_segundos(duracion):
         return 0
 
     try:
-        partes = [int(p) for p in str(duracion).split(":")]
+        partes = [int(p) for p in str(duracion).strip().split(":")]
 
         if not 1 <= len(partes) <= 3:
             return 0
@@ -185,12 +293,99 @@ def duracion_a_segundos(duracion):
         for parte in partes:
             if parte < 0:
                 return 0
+
             total = total * 60 + parte
 
         return total
 
     except (ValueError, TypeError):
         return 0
+
+
+def normalizar_texto(texto):
+    """Minúsculas, sin tildes y con espacios normalizados."""
+    texto = unicodedata.normalize("NFD", str(texto or "").lower())
+    texto = "".join(
+        caracter
+        for caracter in texto
+        if unicodedata.category(caracter) != "Mn"
+    )
+
+    texto = re.sub(r"[^a-z0-9]+", " ", texto)
+    return f" {texto.strip()} "
+
+
+def es_cancion_valida(pista):
+    """
+    Devuelve True si el resultado parece una canción normal
+    y su duración está entre 1 y 7 minutos.
+
+    Los videos sin duración conocida se descartan por seguridad.
+    """
+    if not isinstance(pista, dict):
+        return False
+
+    titulo = str(pista.get("titulo") or "").strip()
+
+    if not titulo or titulo.lower() == "canción desconocida":
+        return False
+
+    duracion = pista.get("duracion_segundos")
+
+    try:
+        duracion = int(duracion or 0)
+    except (ValueError, TypeError):
+        duracion = 0
+
+    if not DURACION_MINIMA <= duracion <= DURACION_MAXIMA:
+        return False
+
+    titulo_normalizado = normalizar_texto(titulo)
+
+    for frase in FRASES_EXCLUIDAS:
+        if normalizar_texto(frase).strip() in titulo_normalizado:
+            return False
+
+    for indicador in INDICADORES_RECORRIDO:
+        if indicador in titulo_normalizado:
+            return False
+
+    return True
+
+
+def filtrar_canciones(canciones, n):
+    """
+    Filtra canciones largas o poco relevantes y elimina duplicados.
+    Conserva el orden original y devuelve como máximo n canciones.
+    """
+    salida = []
+    vistos = set()
+
+    for pista in canciones:
+        if not isinstance(pista, dict):
+            continue
+
+        video_id = pista.get("id")
+
+        if not isinstance(video_id, str):
+            continue
+
+        if not ID_REGEX.fullmatch(video_id):
+            continue
+
+        if video_id in vistos:
+            continue
+
+        if not es_cancion_valida(pista):
+            continue
+
+        vistos.add(video_id)
+        salida.append(pista)
+
+        if len(salida) >= n:
+            break
+
+    return salida
 
 
 def normalizar_pista_ytmusic(track):
@@ -201,6 +396,7 @@ def normalizar_pista_ytmusic(track):
         return None
 
     artistas = track.get("artists") or []
+
     nombres = [
         str(a["name"])
         for a in artistas
@@ -208,6 +404,7 @@ def normalizar_pista_ytmusic(track):
     ]
 
     album = track.get("album")
+
     album_nombre = (
         str(album.get("name") or "")
         if isinstance(album, dict)
@@ -220,7 +417,10 @@ def normalizar_pista_ytmusic(track):
     miniatura = ""
 
     if thumbnails:
-        miniatura = thumbnails[-1].get("url", "")
+        ultima = thumbnails[-1]
+
+        if isinstance(ultima, dict):
+            miniatura = ultima.get("url", "")
 
     if not miniatura:
         miniatura = (
@@ -239,7 +439,9 @@ def normalizar_pista_ytmusic(track):
     }
 
 
-# ---------- seguridad de TU API ----------
+# ==========================================================
+# SEGURIDAD DE TU API
+# ==========================================================
 
 @app.before_request
 def verificar_clave():
@@ -272,7 +474,9 @@ def verificar_clave():
 @app.after_request
 def cabeceras(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Headers"] = "X-API-Key, Content-Type"
+    resp.headers["Access-Control-Allow-Headers"] = (
+        "X-API-Key, Content-Type"
+    )
     resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
     return resp
 
@@ -298,14 +502,14 @@ def error_inesperado(e):
     )
 
 
-# ---------- radio mediante YouTubei ----------
+# ==========================================================
+# RADIO MEDIANTE YOUTUBEI
+# ==========================================================
 
 def radio_youtubei(video_id, n):
     """
-    Extrae pistas de playlistPanelVideoRenderer.
-
-    La respuesta de YouTube puede variar y algunos metadatos
-    podrían no estar disponibles.
+    Extrae candidatos de playlistPanelVideoRenderer.
+    El filtrado musical definitivo se aplica en el endpoint /radio.
     """
     cuerpo = {
         "context": {
@@ -361,7 +565,10 @@ def radio_youtubei(video_id, n):
             if isinstance(renderer, dict):
                 track_id = renderer.get("videoId")
 
-                if isinstance(track_id, str) and ID_REGEX.fullmatch(track_id):
+                if (
+                    isinstance(track_id, str)
+                    and ID_REGEX.fullmatch(track_id)
+                ):
                     titulo = extraer_texto_renderer(
                         renderer, "title"
                     )
@@ -402,7 +609,8 @@ def radio_youtubei(video_id, n):
 
     recorrer(data)
 
-    # Deduplicar sin perder los metadatos de la primera aparición.
+    # Devuelve candidatos sin aplicar todavía el límite final.
+    # Así el endpoint puede filtrar antes de escoger las n canciones.
     salida = []
     vistos = set()
 
@@ -419,13 +627,16 @@ def radio_youtubei(video_id, n):
     return salida
 
 
-# ---------- radio mediante YouTube Music ----------
+# ==========================================================
+# RADIO MEDIANTE YOUTUBE MUSIC
+# ==========================================================
 
 def radio_ytmusic(video_id, n):
-    """Obtiene IDs y metadatos con ytmusicapi, sin API key oficial."""
+    """Obtiene candidatos con ytmusicapi, sin clave oficial."""
     from ytmusicapi import YTMusic
 
     ytmusic = YTMusic()
+
     data = ytmusic.get_watch_playlist(
         videoId=video_id,
         radio=True,
@@ -456,7 +667,9 @@ FUENTES = {
 }
 
 
-# ---------- endpoints ----------
+# ==========================================================
+# ENDPOINTS
+# ==========================================================
 
 @app.get("/")
 def inicio():
@@ -465,11 +678,23 @@ def inicio():
         "endpoints": {
             "/radio": (
                 "?id=<id|link>&n=25&fuente=youtubei|ytmusic "
-                "-> canciones con metadatos disponibles"
+                "-> canciones filtradas de 1 a 7 minutos"
             ),
-            "/buscar": "?q=<texto>&n=10 -> búsqueda de videos",
+            "/buscar": (
+                "?q=<texto>&n=10 -> búsqueda de videos filtrados"
+            ),
             "/id": "?url=<link> -> extrae el ID",
             "/salud": "estado del servicio",
+        },
+        "filtro_musical": {
+            "duracion_minima_segundos": DURACION_MINIMA,
+            "duracion_maxima_segundos": DURACION_MAXIMA,
+            "excluye": [
+                "mixes y megamixes",
+                "álbumes completos y playlists",
+                "tutoriales y reacciones",
+                "videos sin duración conocida",
+            ],
         },
         "autenticacion": (
             "API_KEY propia"
@@ -518,7 +743,10 @@ def radio():
         )
 
     n = entero("n", 25, 1, 50)
-    elegida = (request.args.get("fuente") or "").strip().lower()
+
+    elegida = (
+        request.args.get("fuente") or ""
+    ).strip().lower()
 
     if elegida and elegida not in FUENTES:
         return error(
@@ -535,12 +763,24 @@ def radio():
 
     errores = {}
 
+    # Pedimos más candidatos de los que el usuario necesita.
+    candidatos_n = min(
+        max(n * FACTOR_CANDIDATOS, n),
+        MAX_CANDIDATOS,
+    )
+
     for nombre, funcion in orden:
         try:
-            canciones = funcion(video_id, n)
+            candidatos = funcion(video_id, candidatos_n)
+
+            # FILTRO MUSICAL INTEGRADO
+            canciones = filtrar_canciones(candidatos, n)
 
             if not canciones:
-                errores[nombre] = "Sin resultados"
+                errores[nombre] = (
+                    "No se encontraron canciones que cumplan "
+                    "el filtro de 1 a 7 minutos."
+                )
                 continue
 
             respuesta = jsonify({
@@ -569,7 +809,7 @@ def radio():
     return error(
         502,
         "RADIO_NO_DISPONIBLE",
-        "No se pudo obtener la radio de este video.",
+        "No se pudo obtener canciones válidas para la radio.",
         errores,
     )
 
@@ -591,10 +831,11 @@ def buscar():
         from ytmusicapi import YTMusic
 
         ytmusic = YTMusic()
+
         encontrados = ytmusic.search(
             q,
-            filter="videos",
-            limit=n,
+            filter="songs",
+            limit=min(n * FACTOR_CANDIDATOS, MAX_CANDIDATOS),
         )
 
     except Exception as e:
@@ -605,7 +846,7 @@ def buscar():
             f"{type(e).__name__}: {str(e)[:300]}",
         )
 
-    resultados = []
+    candidatos = []
     vistos = set()
 
     for encontrado in encontrados:
@@ -615,10 +856,10 @@ def buscar():
             continue
 
         vistos.add(pista["id"])
-        resultados.append(pista)
+        candidatos.append(pista)
 
-        if len(resultados) >= n:
-            break
+    # Se aplica el mismo filtro también a la búsqueda.
+    resultados = filtrar_canciones(candidatos, n)
 
     respuesta = jsonify({
         "ok": True,
