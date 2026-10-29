@@ -28,6 +28,15 @@ def opciones_ydl():
         with open(ruta, "w", encoding="utf-8") as f:
             f.write(cookies)
         opts["cookiefile"] = ruta
+    # YouTube exige un runtime de JavaScript (Deno) para resolver los formatos de audio.
+    try:
+        import deno  # paquete de PyPI que incluye el binario de Deno
+
+        os.environ.setdefault("DENO_DIR", "/tmp/deno")  # en Vercel solo /tmp es escribible
+        opts["js_runtimes"] = {"deno": {"path": deno.find_deno_bin()}}
+        opts["remote_components"] = ["ejs:github"]
+    except Exception:
+        app.logger.warning("Deno no disponible: algunos formatos pueden faltar")
     proxy = os.environ.get("YT_PROXY")  # ej: http://usuario:clave@host:puerto
     if proxy:
         opts["proxy"] = proxy
@@ -36,6 +45,8 @@ def opciones_ydl():
 
 # (texto a buscar en el error, código, HTTP status, explicación)
 REGLAS = [
+    ("requested format is not available", "FORMATO_NO_DISPONIBLE", 502,
+     "YouTube no entregó formatos de audio (suele faltar el runtime de JavaScript o yt-dlp está desactualizado)."),
     ("private video", "VIDEO_PRIVADO", 403, "El video es privado."),
     ("video unavailable", "VIDEO_NO_DISPONIBLE", 404, "El video no está disponible o no existe."),
     ("has been removed", "VIDEO_ELIMINADO", 404, "El video fue eliminado."),
