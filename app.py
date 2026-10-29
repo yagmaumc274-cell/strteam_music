@@ -1,82 +1,34 @@
+"""API de consulta: IDs de la radio de un video de YouTube (y búsqueda de IDs). Sin yt-dlp..
+
+Endpoints (todos devuelven JSON):
+  GET /                       -> documentación breve
+  GET /radio?id=<id|link>&n=25[&fuente=youtubei|ytmusic]
+  GET /buscar?q=<texto>&n=10
+  GET /id?url=<link>
+  GET /salud
+
+Seguridad opcional: si defines la variable de entorno API_KEY, hay que enviar
+la clave en el encabezado  X-API-Key: <clave>  (o en ?key=<clave>).
+Proxy opcional: variable YT_PROXY (http://usuario:clave@host:puerto), solo para la fuente youtubei.
+"""
+import hmac
 import json
 import os
 import re
 import urllib.request
 
-import yt_dlp
-from flask import Flask, Response, jsonify, render_template_string, request
-from yt_dlp.utils import DownloadError, ExtractorError, UnsupportedError
+from flask import Flask, jsonify, request
+from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
 app.json.ensure_ascii = False
+app.json.sort_keys = False
 
 ID_REGEX = re.compile(r"^[A-Za-z0-9_-]{11}$")
 URL_ID_REGEX = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})")
 
-YDL_OPTS = {
-    "quiet": True,
-    "no_warnings": True,
-    "noplaylist": True,
-    "format": "ba/b",
-    "socket_timeout": 10,
-}
 
-# Clientes de YouTube a probar, en orden (None = el predeterminado de yt-dlp)
-CLIENTES = [None, "tv", "web_safari", "mweb", "android_vr"]
-
-
-def opciones_ydl():
-    """Opciones base + cookies y proxy opcionales tomados de variables de entorno."""
-    opts = dict(YDL_OPTS)
-    cookies = os.environ.get("YT_COOKIES")  # contenido del cookies.txt (formato Netscape)
-    try:
-        if request.args.get("sincookies"):  # ?sincookies=1 para probar sin cookies
-            cookies = None
-    except RuntimeError:
-        pass  # fuera de una petición web
-    if cookies:
-        ruta = "/tmp/yt_cookies.txt"  # en Vercel solo /tmp es escribible
-        with open(ruta, "w", encoding="utf-8") as f:
-            f.write(cookies)
-        opts["cookiefile"] = ruta
-    # YouTube exige un runtime de JavaScript (Deno) para resolver los formatos de audio.
-    try:
-        import deno  # paquete de PyPI que incluye el binario de Deno
-
-        os.environ.setdefault("DENO_DIR", "/tmp/deno")  # en Vercel solo /tmp es escribible
-        opts["js_runtimes"] = {"deno": {"path": deno.find_deno_bin()}}
-        opts["remote_components"] = ["ejs:github"]
-    except Exception:
-        app.logger.warning("Deno no disponible: algunos formatos pueden faltar")
-    proxy = os.environ.get("YT_PROXY")  # ej: http://usuario:clave@host:puerto
-    if proxy:
-        opts["proxy"] = proxy
-    return opts
-
-
-# (texto a buscar en el error, código, HTTP status, explicación)
-REGLAS = [
-    ("requested format is not available", "FORMATO_NO_DISPONIBLE", 502,
-     "YouTube no entregó formatos de audio (suele faltar el runtime de JavaScript o yt-dlp está desactualizado)."),
-    ("page needs to be reloaded", "SESION_INVALIDA", 502,
-     "YouTube rechazó la sesión (cookies vencidas o usadas desde otra IP). Prueba con ?sincookies=1 o exporta cookies nuevas."),
-    ("private video", "VIDEO_PRIVADO", 403, "El video es privado."),
-    ("video unavailable", "VIDEO_NO_DISPONIBLE", 404, "El video no está disponible o no existe."),
-    ("has been removed", "VIDEO_ELIMINADO", 404, "El video fue eliminado."),
-    ("confirm your age", "RESTRICCION_EDAD", 403, "El video tiene restricción de edad."),
-    ("sign in to confirm you", "BLOQUEO_BOT", 429, "YouTube detectó tráfico automatizado y pide iniciar sesión o cookies."),
-    ("available in your country", "BLOQUEO_REGION", 451, "Este video está bloqueado en el país del servidor (Vercel). Cambia la región de la función a un país donde esté disponible."),
-    ("not available in your country", "BLOQUEO_REGION", 451, "Video bloqueado en la región del servidor."),
-    ("copyright", "DERECHOS_AUTOR", 451, "Video bloqueado por derechos de autor."),
-    ("members-only", "SOLO_MIEMBROS", 403, "Video solo para miembros del canal."),
-    ("live event will begin", "LIVE_NO_INICIADO", 409, "La transmisión en vivo aún no comienza."),
-    ("timed out", "TIMEOUT", 504, "Tiempo de espera agotado al contactar YouTube."),
-    ("unable to download webpage", "ERROR_RED", 502, "No se pudo conectar con YouTube."),
-    ("http error 429", "DEMASIADAS_SOLICITUDES", 429, "Demasiadas solicitudes a YouTube."),
-    ("http error 403", "ACCESO_DENEGADO", 403, "YouTube denegó el acceso."),
-]
-
-
+# ---------- utilidades ----------
 def parse_video_id(texto):
     """Acepta un ID de 11 caracteres o un link de YouTube (watch, youtu.be, shorts, embed)."""
     texto = (texto or "").strip()
@@ -86,386 +38,64 @@ def parse_video_id(texto):
     return m.group(1) if m else None
 
 
-def clasificar(e):
-    msg = str(e).lower()
-    for clave, codigo, status, explicacion in REGLAS:
-        if clave in msg:
-            return codigo, status, explicacion
-    return "ERROR_NO_CLASIFICADO", 502, "Error no clasificado."
+def unicos(ids, n):
+    """Quita vacíos, inválidos y repetidos conservando el orden."""
+    vistos, salida = set(), []
+    for i in ids:
+        if i and ID_REGEX.match(i) and i not in vistos:
+            vistos.add(i)
+            salida.append(i)
+    return salida[:n]
 
 
-def error_payload(tipo, codigo, explicacion, detalle=None):
-    return {"ok": False, "error": {"tipo": tipo, "codigo": codigo,
-                                   "explicacion": explicacion, "detalle": detalle}}
-
-
-def procesar(entrada):
-    """Valida el ID, consulta YouTube y devuelve (status_http, dict_json)."""
-    video_id = parse_video_id(entrada)
-    if not video_id:
-        return 400, error_payload(
-            "ValidationError", "ENTRADA_INVALIDA",
-            "Ingresa un ID de video (11 caracteres) o un link de YouTube válido.")
-    url = f"https://www.youtube.com/watch?v={video_id}"
+def entero(nombre, defecto, minimo, maximo):
     try:
-        info, cliente = None, "default"
-        ultimo_error = None
-        # Si YouTube no entrega formatos con el cliente por defecto, se prueban otros.
-        for cliente_prueba in CLIENTES:
-            opts = opciones_ydl()
-            if cliente_prueba:
-                opts["extractor_args"] = {"youtube": {"player_client": [cliente_prueba]}}
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)  # solo metadatos
-                cliente = cliente_prueba or "default"
-                break
-            except DownloadError as e:
-                ultimo_error = e
-                if "requested format is not available" not in str(e).lower():
-                    raise
-        if info is None:
-            raise ultimo_error
-        if not info.get("url"):
-            return 502, error_payload("AudioNotFound", "AUDIO_NO_ENCONTRADO",
-                                      "No se encontró una URL de audio para este video.")
-        return 200, {"ok": True, "data": {
-            "id": info.get("id"),
-            "titulo": info.get("title"),
-            "canal": info.get("uploader"),
-            "duracion_segundos": info.get("duration"),
-            "vistas": info.get("view_count"),
-            "fecha_subida": info.get("upload_date"),
-            "miniatura": info.get("thumbnail"),
-            "url_audio": info.get("url"),
-            "cliente_youtube": cliente,
-        }}
-    except DownloadError as e:
-        codigo, status, expl = clasificar(e)
-        return status, error_payload("DownloadError", codigo, expl, str(e))
-    except UnsupportedError as e:
-        return 400, error_payload("UnsupportedError", "URL_NO_SOPORTADA", "La URL no es compatible.", str(e))
-    except ExtractorError as e:
-        return 502, error_payload("ExtractorError", "FALLO_EXTRACCION", "Falló la extracción de datos.", str(e))
-    except Exception as e:
-        app.logger.exception("Error inesperado")
-        return 500, error_payload(type(e).__name__, "ERROR_INESPERADO", "Error inesperado.", str(e))
-
-
-def duracion(seg):
-    if not isinstance(seg, (int, float)):
-        return "—"
-    seg = int(seg)
-    h, r = divmod(seg, 3600)
-    m, s = divmod(r, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-
-PAGINA = """<!doctype html>
-<html lang="es">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Extractor de audio</title>
-<style>
-  :root { --bg:#0f1115; --card:#181b22; --line:#2a2f3a; --txt:#e8eaf0; --mut:#9aa3b2; --ac:#4f8cff; --ok:#3ecf8e; --err:#ff6b6b; }
-  @media (prefers-color-scheme: light) {
-    :root { --bg:#f5f6f8; --card:#fff; --line:#dde1e8; --txt:#161a22; --mut:#5d6675; --ac:#2563eb; --ok:#0f9d63; --err:#d63c3c; }
-  }
-  * { box-sizing:border-box }
-  body { margin:0; background:var(--bg); color:var(--txt); font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; padding:24px 16px }
-  main { max-width:640px; margin:0 auto }
-  h1 { font-size:1.4rem; margin:0 0 4px }
-  p.sub { color:var(--mut); margin:0 0 20px }
-  form { display:flex; gap:8px; flex-wrap:wrap }
-  input[type=text] { flex:1 1 260px; padding:12px 14px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--txt); font-size:1rem }
-  input[type=text]:focus { outline:2px solid var(--ac); border-color:transparent }
-  button { padding:12px 20px; border:0; border-radius:10px; background:var(--ac); color:#fff; font-size:1rem; font-weight:600; cursor:pointer }
-  .card { margin-top:20px; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; overflow:hidden }
-  .card.err { border-color:var(--err) }
-  .card img { width:100%; border-radius:10px; display:block; margin-bottom:12px }
-  .tag { display:inline-block; font-size:.75rem; font-weight:700; padding:2px 8px; border-radius:999px; margin-bottom:8px }
-  .tag.ok { color:var(--ok); border:1px solid var(--ok) }
-  .tag.err { color:var(--err); border:1px solid var(--err) }
-  h2 { font-size:1.15rem; margin:0 0 8px }
-  dl { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; margin:0 }
-  dt { color:var(--mut) } dd { margin:0; word-break:break-word }
-  code { background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:1px 6px; font-size:.85rem }
-  audio { width:100%; margin-top:14px }
-  details { margin-top:10px; color:var(--mut) }
-  pre { white-space:pre-wrap; word-break:break-word; font-size:.8rem; background:var(--bg); padding:10px; border-radius:8px; border:1px solid var(--line) }
-  footer { margin-top:28px; color:var(--mut); font-size:.85rem }
-</style>
-</head>
-<body>
-<main>
-  <h1>🎵 Extractor de audio</h1>
-  <p class="sub">Ingresa el ID o el link de un video de YouTube para obtener sus datos.</p>
-
-  <form method="get" action="/">
-    <input type="text" name="id" value="{{ entrada }}" placeholder="Ej: Q27iObu4lZc o https://youtu.be/Q27iObu4lZc"
-           autocomplete="off" autofocus required>
-    <button type="submit">Consultar</button>
-  </form>
-
-  {% if resultado %}
-    {% if resultado.ok %}
-      {% set d = resultado.data %}
-      <section class="card">
-        <span class="tag ok">✅ ÉXITO</span>
-        {% if d.miniatura %}<img src="{{ d.miniatura }}" alt="Miniatura">{% endif %}
-        <h2>{{ d.titulo }}</h2>
-        <dl>
-          <dt>Canal</dt><dd>{{ d.canal or "—" }}</dd>
-          <dt>Duración</dt><dd>{{ dur }}</dd>
-          <dt>Vistas</dt><dd>{{ "{:,}".format(d.vistas) if d.vistas else "—" }}</dd>
-          <dt>Subido</dt><dd>{{ fecha }}</dd>
-          <dt>ID</dt><dd><code>{{ d.id }}</code></dd>
-          <dt>Endpoints</dt><dd><code>/audio/{{ d.id }}</code> · <code>/api/info?id={{ d.id }}</code></dd>
-        </dl>
-        <audio controls preload="none" src="{{ d.url_audio }}"></audio>
-      </section>
-    {% else %}
-      {% set e = resultado.error %}
-      <section class="card err">
-        <span class="tag err">❌ ERROR · {{ e.tipo }}</span>
-        <h2>{{ e.explicacion }}</h2>
-        <dl>
-          <dt>Código</dt><dd><code>{{ e.codigo }}</code></dd>
-          <dt>HTTP</dt><dd>{{ status }}</dd>
-        </dl>
-        {% if e.detalle %}<details><summary>Detalle técnico</summary><pre>{{ e.detalle }}</pre></details>{% endif %}
-      </section>
-    {% endif %}
-  {% endif %}
-
-  <footer>API: <code>/audio/&lt;id&gt;</code> devuelve la URL del audio en texto · <code>/api/info?id=&lt;id&gt;</code> devuelve JSON.</footer>
-</main>
-</body>
-</html>"""
-
-
-@app.after_request
-def cors(resp):
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    return resp
-
-
-@app.route("/audio-test")
-def inicio_audio():
-    """Pide el ID/link primero; al enviarlo muestra los datos o el error."""
-    entrada = (request.args.get("id") or request.args.get("url") or "").strip()
-    resultado, status, dur, fecha = None, 200, "—", "—"
-    if entrada:
-        status, resultado = procesar(entrada)
-        if resultado["ok"]:
-            d = resultado["data"]
-            dur = duracion(d["duracion_segundos"])
-            f = d.get("fecha_subida") or ""
-            fecha = f"{f[6:8]}/{f[4:6]}/{f[:4]}" if len(f) == 8 else "—"
-    resp = Response(render_template_string(
-        PAGINA, entrada=entrada, resultado=resultado, status=status, dur=dur, fecha=fecha),
-        mimetype="text/html")
-    return resp
-
-
-PAGINA_RADIO = """<!doctype html>
-<html lang="es">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Radio de YouTube</title>
-<style>
-  :root { --bg:#0f1115; --card:#181b22; --line:#2a2f3a; --txt:#e8eaf0; --mut:#9aa3b2; --ac:#4f8cff; --ok:#3ecf8e; --err:#ff6b6b; }
-  @media (prefers-color-scheme: light) {
-    :root { --bg:#f5f6f8; --card:#fff; --line:#dde1e8; --txt:#161a22; --mut:#5d6675; --ac:#2563eb; --ok:#0f9d63; --err:#d63c3c; }
-  }
-  * { box-sizing:border-box }
-  body { margin:0; background:var(--bg); color:var(--txt); font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; padding:24px 16px }
-  main { max-width:640px; margin:0 auto }
-  h1 { font-size:1.4rem; margin:0 0 4px } p.sub { color:var(--mut); margin:0 0 20px }
-  form { display:flex; gap:8px; flex-wrap:wrap }
-  input[type=text] { flex:1 1 260px; padding:12px 14px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--txt); font-size:1rem }
-  input[type=text]:focus { outline:2px solid var(--ac); border-color:transparent }
-  button { padding:12px 20px; border:0; border-radius:10px; background:var(--ac); color:#fff; font-size:1rem; font-weight:600; cursor:pointer }
-  .card { margin-top:20px; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px }
-  .card.err { border-color:var(--err) }
-  .tag { display:inline-block; font-size:.75rem; font-weight:700; padding:2px 8px; border-radius:999px; margin-bottom:8px }
-  .tag.ok { color:var(--ok); border:1px solid var(--ok) } .tag.err { color:var(--err); border:1px solid var(--err) }
-  ol { margin:10px 0; padding-left:28px } li { padding:2px 0 }
-  code { background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:1px 6px; font-size:.85rem }
-  pre { white-space:pre-wrap; word-break:break-word; font-size:.8rem; background:var(--bg); padding:10px; border-radius:8px; border:1px solid var(--line) }
-  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px }
-  .row button { padding:8px 14px; font-size:.9rem; background:var(--card); color:var(--txt); border:1px solid var(--line) }
-  footer { margin-top:28px; color:var(--mut); font-size:.85rem }
-</style>
-</head>
-<body>
-<main>
-  <h1>📻 Radio de YouTube</h1>
-  <p class="sub">Ingresa el ID o el link de un video y obtén los IDs de su radio (videos relacionados).</p>
-  <form method="get" action="/">
-    <input type="text" name="id" value="{{ entrada }}" placeholder="Ej: kJQP7kiw5Fk o un link de YouTube" autocomplete="off" autofocus required>
-    <button type="submit">Obtener radio</button>
-  </form>
-
-  {% if resultado %}
-    {% if resultado.ok %}
-      <section class="card">
-        <span class="tag ok">✅ {{ resultado.total }} IDs · fuente: {{ resultado.fuente }}</span>
-        <ol>{% for i in resultado.ids %}<li><code>{{ i }}</code></li>{% endfor %}</ol>
-        <div class="row">
-          <button type="button" onclick="navigator.clipboard.writeText({{ resultado.ids|join(',')|tojson }})">Copiar IDs (separados por coma)</button>
-          <button type="button" onclick="navigator.clipboard.writeText({{ resultado.ids|join('\n')|tojson }})">Copiar IDs (uno por línea)</button>
-        </div>
-      </section>
-    {% else %}
-      {% set e = resultado.error %}
-      <section class="card err">
-        <span class="tag err">❌ ERROR · {{ e.tipo }}</span>
-        <h2 style="font-size:1.1rem;margin:0 0 8px">{{ e.explicacion }}</h2>
-        {% if e.detalle %}<details open><summary>Detalle por fuente</summary>
-          {% if e.detalle is mapping %}{% for k, v in e.detalle.items() %}<p><code>{{ k }}</code></p><pre>{{ v }}</pre>{% endfor %}
-          {% else %}<pre>{{ e.detalle }}</pre>{% endif %}
-        </details>{% endif %}
-      </section>
-    {% endif %}
-  {% endif %}
-
-  <footer>API: <code>/radio?id=&lt;id&gt;&amp;n=25</code> devuelve JSON con los IDs · <code>/buscar?q=&lt;texto&gt;</code> busca videos.</footer>
-</main>
-</body>
-</html>"""
-
-
-@app.route("/")
-def inicio():
-    """Pide el ID/link y muestra los IDs de su radio."""
-    entrada = (request.args.get("id") or request.args.get("url") or "").strip()
-    resultado = None
-    if entrada:
-        video_id = parse_video_id(entrada)
-        if video_id:
-            _, resultado = obtener_radio(video_id, 25, (request.args.get("fuente") or "").strip().lower())
-        else:
-            resultado = error_payload("ValidationError", "ENTRADA_INVALIDA",
-                                      "Ingresa un ID de video (11 caracteres) o un link de YouTube válido.")
-    return Response(render_template_string(PAGINA_RADIO, entrada=entrada, resultado=resultado),
-                    mimetype="text/html")
-
-
-@app.route("/audio/<video_id>")
-def obtener_audio(video_id):
-    """Compatible con la versión anterior: devuelve solo la URL del audio como texto."""
-    if not ID_REGEX.fullmatch(video_id):
-        return Response("ID no válido", status=400, mimetype="text/plain")
-    status, body = procesar(video_id)
-    if body["ok"]:
-        return Response(body["data"]["url_audio"], mimetype="text/plain")
-    return Response(body["error"]["explicacion"], status=status, mimetype="text/plain")
-
-
-@app.route("/api/info")
-def api_info():
-    """Datos completos en JSON; en caso de fallo, tipo y causa del error."""
-    status, body = procesar(request.args.get("id") or request.args.get("url") or "")
-    resp = jsonify(body)
-    resp.status_code = status
-    return resp
-
-
-@app.route("/id")
-def sacar_id():
-    """Extrae el ID de un link de YouTube. No consulta a YouTube, así que no puede ser bloqueado."""
-    video_id = parse_video_id(request.args.get("url") or request.args.get("id") or "")
-    if not video_id:
-        return jsonify({"ok": False, "error": "No se encontró un ID válido."}), 400
-    return jsonify({"ok": True, "id": video_id})
-
-
-@app.route("/buscar")
-def buscar():
-    """Busca en YouTube y devuelve solo IDs y datos básicos (sin formatos de audio).
-    Uso: /buscar?q=nombre de la canción&n=10"""
-    q = (request.args.get("q") or "").strip()
-    if not q:
-        return jsonify(error_payload("ValidationError", "FALTA_BUSQUEDA",
-                                     "Falta el parámetro 'q' con el texto a buscar.")), 400
-    try:
-        n = max(1, min(int(request.args.get("n", 10)), 25))
+        return max(minimo, min(int(request.args.get(nombre, defecto)), maximo))
     except ValueError:
-        n = 10
-    opts = opciones_ydl()
-    opts.update({"extract_flat": True, "skip_download": True, "format": None,
-                 "ignore_no_formats_error": True})
-    opts.pop("js_runtimes", None)
-    opts.pop("remote_components", None)
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch{n}:{q}", download=False)
-        resultados = [{
-            "id": e.get("id"),
-            "titulo": e.get("title"),
-            "canal": e.get("uploader") or e.get("channel"),
-            "duracion_segundos": e.get("duration"),
-            "miniatura": (e.get("thumbnails") or [{}])[-1].get("url") if e.get("thumbnails") else None,
-        } for e in (info.get("entries") or []) if e and e.get("id")]
-        return jsonify({"ok": True, "consulta": q, "total": len(resultados), "resultados": resultados})
-    except DownloadError as e:
-        codigo, status, expl = clasificar(e)
-        r = jsonify(error_payload("DownloadError", codigo, expl, str(e)))
-        r.status_code = status
-        return r
-    except Exception as e:
-        app.logger.exception("Error en búsqueda")
-        r = jsonify(error_payload(type(e).__name__, "ERROR_INESPERADO", "Error inesperado.", str(e)))
-        r.status_code = 500
-        return r
+        return defecto
 
 
-def obtener_radio(video_id, n, elegida=""):
-    """Devuelve (status_http, dict_json) con los IDs de la radio de un video."""
-    fuentes = {"youtubei": radio_youtubei, "youtube_mix": radio_mix_ytdlp, "ytmusic": radio_ytmusic}
-    if elegida in fuentes:
-        orden = [(elegida, fuentes[elegida])]  # forzar una sola fuente (útil para probar)
-    else:
-        orden = list(fuentes.items())  # por defecto: youtubei, Mix con yt-dlp y YouTube Music
-    errores = {}
-    for fuente, funcion in orden:
-        try:
-            ids = funcion(video_id, n)
-            if ids:
-                return 200, {"ok": True, "semilla": video_id, "fuente": fuente,
-                             "total": len(ids), "ids": ids}
-            errores[fuente] = "Sin resultados"
-        except Exception as e:
-            app.logger.warning("radio %s falló: %s", fuente, e)
-            errores[fuente] = f"{type(e).__name__}: {str(e)[:300]}"
-    return 502, error_payload("RadioError", "RADIO_NO_DISPONIBLE",
-                              "No se pudo obtener la radio de este video.", errores)
-
-
-@app.route("/radio")
-def radio():
-    """Radio de un video: devuelve solo IDs de videos relacionados.
-    Uso: /radio?id=kJQP7kiw5Fk&n=25   (también acepta ?url=<link de YouTube>)
-    Con ?fuente=youtubei | youtube_mix | ytmusic se fuerza una sola fuente."""
-    video_id = parse_video_id(request.args.get("id") or request.args.get("url") or "")
-    if not video_id:
-        return jsonify(error_payload("ValidationError", "ENTRADA_INVALIDA",
-                                     "Ingresa un ID de video (11 caracteres) o un link de YouTube válido.")), 400
-    try:
-        n = max(1, min(int(request.args.get("n", 25)), 50))
-    except ValueError:
-        n = 25
-    status, body = obtener_radio(video_id, n, (request.args.get("fuente") or "").strip().lower())
-    r = jsonify(body)
+def error(status, codigo, mensaje, detalle=None):
+    r = jsonify({"ok": False, "error": {"codigo": codigo, "mensaje": mensaje, "detalle": detalle}})
     r.status_code = status
     return r
 
 
+
+# ---------- seguridad y respuestas ----------
+@app.before_request
+def verificar_clave():
+    clave = os.environ.get("API_KEY")
+    if not clave or request.method == "OPTIONS" or request.path in ("/", "/salud"):
+        return None
+    enviada = request.headers.get("X-API-Key") or request.args.get("key") or ""
+    if not hmac.compare_digest(enviada, clave):
+        return error(401, "NO_AUTORIZADO", "Falta o es incorrecta la clave de la API (X-API-Key).")
+    return None
+
+
+@app.after_request
+def cabeceras(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "X-API-Key, Content-Type"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    return resp
+
+
+@app.errorhandler(HTTPException)
+def http_error(e):
+    return error(e.code or 500, e.name.upper().replace(" ", "_"), e.description)
+
+
+@app.errorhandler(Exception)
+def error_inesperado(e):
+    app.logger.exception("Error inesperado")
+    return error(500, "ERROR_INESPERADO", "Error inesperado.", f"{type(e).__name__}: {e}")
+
+
+# ---------- fuentes de radio ----------
 def radio_youtubei(video_id, n):
-    """Pide el Mix directamente a YouTube (endpoint interno /next), sin yt-dlp."""
+    """Pide el Mix (RD<id>) directamente a YouTube, sin librerías."""
     cuerpo = {
         "context": {"client": {"clientName": "WEB", "clientVersion": "2.20250101.00.00",
                                "hl": "es", "gl": "US"}},
@@ -490,6 +120,7 @@ def radio_youtubei(video_id, n):
         else urllib.request.ProxyHandler())
     with opener.open(req, timeout=10) as r:
         data = json.load(r)
+
     ids = []
 
     def recorrer(x):
@@ -509,64 +140,89 @@ def radio_youtubei(video_id, n):
 
 def radio_ytmusic(video_id, n):
     from ytmusicapi import YTMusic
-    yt = YTMusic()
-    data = yt.get_watch_playlist(videoId=video_id, radio=True, limit=n)
+    data = YTMusic().get_watch_playlist(videoId=video_id, radio=True, limit=n)
     return unicos([t.get("videoId") for t in data.get("tracks", [])], n)
 
 
-def radio_mix_ytdlp(video_id, n):
-    opts = opciones_ydl()
-    opts.update({"extract_flat": True, "skip_download": True, "format": None,
-                 "ignore_no_formats_error": True, "noplaylist": False, "playlistend": n})
-    opts.pop("js_runtimes", None)
-    opts.pop("remote_components", None)
-    url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}&start_radio=1"
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-    return unicos([e.get("id") for e in (info.get("entries") or []) if e], n)
+FUENTES = {"youtubei": radio_youtubei, "ytmusic": radio_ytmusic}
 
 
-def unicos(ids, n):
-    """Quita vacíos y repetidos conservando el orden."""
-    vistos, salida = set(), []
-    for i in ids:
-        if i and ID_REGEX.match(i) and i not in vistos:
-            vistos.add(i)
-            salida.append(i)
-    return salida[:n]
+# ---------- endpoints ----------
+@app.get("/")
+def inicio():
+    return jsonify({
+        "nombre": "API de radio de YouTube (solo IDs)",
+        "endpoints": {
+            "/radio": "?id=<id|link>&n=25&fuente=youtubei|ytmusic -> IDs de la radio",
+            "/buscar": "?q=<texto>&n=10 -> IDs y datos básicos de una búsqueda",
+            "/id": "?url=<link> -> extrae el ID de un link",
+            "/salud": "estado del servicio",
+        },
+        "autenticacion": "X-API-Key" if os.environ.get("API_KEY") else "ninguna",
+    })
 
 
-@app.route("/debug")
-def debug():
-    """Diagnóstico: versiones y si Deno está disponible. No muestra cookies ni datos sensibles."""
-    import subprocess
-    out = {"yt_dlp": getattr(getattr(yt_dlp, "version", None), "__version__", "?"),
-           "cookies_configuradas": bool(os.environ.get("YT_COOKIES")),
-           "proxy_configurado": bool(os.environ.get("YT_PROXY")),
-           "region_vercel": os.environ.get("VERCEL_REGION")}
-    try:
-        import deno
-        ruta = deno.find_deno_bin()
-        out["deno_ruta"] = ruta
-        r = subprocess.run([ruta, "--version"], capture_output=True, text=True, timeout=10,
-                           env={**os.environ, "DENO_DIR": "/tmp/deno"})
-        out["deno_version"] = (r.stdout or r.stderr).strip().splitlines()[:1]
-    except Exception as e:
-        out["deno_error"] = f"{type(e).__name__}: {e}"
-    vid = parse_video_id(request.args.get("id", ""))
-    if vid:
+@app.get("/salud")
+def salud():
+    return jsonify({"ok": True})
+
+
+@app.get("/id")
+def sacar_id():
+    video_id = parse_video_id(request.args.get("url") or request.args.get("id") or "")
+    if not video_id:
+        return error(400, "ENTRADA_INVALIDA", "No se encontró un ID de video válido.")
+    return jsonify({"ok": True, "id": video_id})
+
+
+@app.get("/radio")
+def radio():
+    video_id = parse_video_id(request.args.get("id") or request.args.get("url") or "")
+    if not video_id:
+        return error(400, "ENTRADA_INVALIDA",
+                     "Envía 'id' (11 caracteres) o 'url' (link de YouTube) válidos.")
+    n = entero("n", 25, 1, 50)
+    elegida = (request.args.get("fuente") or "").strip().lower()
+    if elegida and elegida not in FUENTES:
+        return error(400, "FUENTE_INVALIDA", f"Fuente desconocida. Usa: {', '.join(FUENTES)}.")
+    orden = [(elegida, FUENTES[elegida])] if elegida else list(FUENTES.items())
+
+    errores = {}
+    for nombre, funcion in orden:
         try:
-            opts = opciones_ydl()
-            opts.update({"format": None, "ignore_no_formats_error": True, "skip_download": True})
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
-            fmts = info.get("formats") or []
-            out["formatos_total"] = len(fmts)
-            out["formatos_audio"] = len([f for f in fmts if f.get("vcodec") == "none"])
-            out["formatos_ejemplo"] = [f"{f.get('format_id')}:{f.get('ext')}:{f.get('format_note') or ''}" for f in fmts[:8]]
+            ids = funcion(video_id, n)
+            if ids:
+                r = jsonify({"ok": True, "semilla": video_id, "fuente": nombre,
+                             "total": len(ids), "ids": ids})
+                r.headers["Cache-Control"] = "no-store"  # la radio cambia en cada consulta
+                return r
+            errores[nombre] = "Sin resultados"
         except Exception as e:
-            out["formatos_error"] = f"{type(e).__name__}: {str(e)[:300]}"
-    return jsonify(out)
+            app.logger.warning("radio %s falló: %s", nombre, e)
+            errores[nombre] = f"{type(e).__name__}: {str(e)[:300]}"
+    return error(502, "RADIO_NO_DISPONIBLE", "No se pudo obtener la radio de este video.", errores)
+
+
+@app.get("/buscar")
+def buscar():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return error(400, "FALTA_BUSQUEDA", "Falta el parámetro 'q' con el texto a buscar.")
+    n = entero("n", 10, 1, 25)
+    try:
+        from ytmusicapi import YTMusic
+        encontrados = YTMusic().search(q, filter="videos", limit=n)
+    except Exception as e:
+        return error(502, "BUSQUEDA_FALLIDA", "No se pudo realizar la búsqueda.", f"{type(e).__name__}: {str(e)[:300]}")
+    resultados = [{
+        "id": e.get("videoId"),
+        "titulo": e.get("title"),
+        "canal": (e.get("artists") or [{}])[0].get("name"),
+        "duracion": e.get("duration"),
+    } for e in encontrados if e.get("videoId")][:n]
+    r = jsonify({"ok": True, "consulta": q, "total": len(resultados), "resultados": resultados})
+    r.headers["Cache-Control"] = "s-maxage=300, stale-while-revalidate"
+    return r
 
 
 if __name__ == "__main__":
